@@ -11,12 +11,28 @@ class EasyPostService
 {
     private ?EasyPostClient $client = null;
 
-    public function getRates(): array
+    /**
+     * @return array<string, mixed>
+     */
+    public function getConfiguredRates(): array
     {
-        $apiKey = $this->getApiKey();
         $fromAddress = $this->getConfigArray('shipping.easypost.defaults.from_address');
         $toAddress = $this->getConfigArray('shipping.easypost.defaults.to_address');
         $parcel = $this->getConfigArray('shipping.easypost.defaults.parcel');
+
+        return $this->getRates($fromAddress, $toAddress, $parcel);
+    }
+
+    /**
+     * @param  array<string, mixed>  $fromAddress
+     * @param  array<string, mixed>  $toAddress
+     * @param  array<string, mixed>|null  $parcel
+     * @return array<string, mixed>
+     */
+    public function getRates(array $fromAddress, array $toAddress, ?array $parcel = null): array
+    {
+        $apiKey = $this->getApiKey();
+        $parcel = $parcel ?? $this->getConfigArray('shipping.easypost.defaults.parcel');
         $units = $this->getOptionalConfigArray('shipping.easypost.defaults.units');
 
         try {
