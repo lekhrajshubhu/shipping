@@ -1,0 +1,22 @@
+{
+    "$schema": "https://getcomposer.org/schema.json",
+    "name": "systha/shipping",
+    "description": "Systha Shipping Laravel Package",
+    "type": "library",
+    "license": "proprietary",
+    "autoload": {
+        "psr-4": {
+            "Systha\\Shipping\\": "src/"
+        }
+    },
+    "require": {
+        "php": "^8.3"
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "Systha\\Shipping\\ShippingServiceProvider"
+            ]
+        }
+    }
+}
