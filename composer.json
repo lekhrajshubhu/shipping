@@ -10,7 +10,8 @@
         }
     },
     "require": {
-        "php": "^8.3"
+        "php": "^8.3",
+        "easypost/easypost-php": "^8.0"
     },
     "extra": {
         "laravel": {
