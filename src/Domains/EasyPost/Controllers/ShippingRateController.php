@@ -2,21 +2,21 @@
 
 namespace Systha\Shipping\Domains\EasyPost\Controllers;
 
+use EasyPost\Exception\General\EasyPostException;
 use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
 use Illuminate\Routing\Controller;
+use RuntimeException;
 use Systha\Shipping\Domains\EasyPost\Requests\ShippingRateRequest;
 use Systha\Shipping\Domains\EasyPost\Resources\ShippingRateResource;
 use Systha\Shipping\Domains\EasyPost\Services\EasyPostService;
-use EasyPost\Exception\General\EasyPostException;
-use RuntimeException;
 use Throwable;
 
 class ShippingRateController extends Controller
 {
     public function __construct(
         private readonly EasyPostService $easyPostService
-    ) {
-    }
+    ) {}
 
     public function estimate(ShippingRateRequest $request): JsonResponse
     {
@@ -27,14 +27,14 @@ class ShippingRateController extends Controller
                 $data['to_address']
             );
             return $this->buildSuccessResponse($result);
-        } catch (RuntimeException|Throwable $exception) {
+        } catch (RuntimeException | Throwable $exception) {
             $status = $this->determineStatusCode($exception);
 
             return response()->json([
                 'success' => false,
                 'message' => $status === 502
                     ? 'Unable to retrieve shipping rates from EasyPost.'
-                : 'Unable to estimate shipping rates.',
+                    : 'Unable to estimate shipping rates.',
             ], $status);
         }
     }
@@ -45,7 +45,7 @@ class ShippingRateController extends Controller
             $result = $this->easyPostService->getConfiguredRates();
 
             return $this->buildSuccessResponse($result);
-        } catch (RuntimeException|Throwable $exception) {
+        } catch (RuntimeException | Throwable $exception) {
             $status = $this->determineStatusCode($exception);
 
             return response()->json([
@@ -89,5 +89,46 @@ class ShippingRateController extends Controller
         }
 
         return 500;
+    }
+
+    public function selected(Request $request): JsonResponse
+    {
+        $data = $request->validate([
+            'shipment_id' => ['required', 'string'],
+            'rate_id' => ['required', 'string'],
+        ]);
+
+        $result = $this->easyPostService->getSelectedRate(
+            $data['shipment_id'],
+            $data['rate_id']
+        );
+
+        return response()->json([
+            'success' => true,
+            'data' => $result,
+        ]);
+    }
+
+    public function shipmentRates(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'shipment_id' => ['required', 'string'],
+        ]);
+
+        try {
+            $result = $this->easyPostService->getShipmentRates(
+                $validated['shipment_id']
+            );
+
+            return response()->json([
+                'success' => true,
+                'data' => $result,
+            ]);
+        } catch (\RuntimeException $e) {
+            return response()->json([
+                'success' => false,
+                'message' => $e->getMessage(),
+            ], 502);
+        }
     }
 }

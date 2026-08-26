@@ -3,6 +3,7 @@
 namespace Systha\Shipping\Domains\EasyPost\Services;
 
 use EasyPost\EasyPostClient;
+use EasyPost\Exception\Api\ApiException;
 use EasyPost\Exception\General\EasyPostException;
 use RuntimeException;
 use Throwable;
@@ -41,7 +42,7 @@ class EasyPostService
                 'to_address' => $toAddress,
                 'parcel' => $parcel,
             ]);
-        } catch (EasyPostException|Throwable $exception) {
+        } catch (EasyPostException | Throwable $exception) {
             throw new RuntimeException(
                 'EasyPost shipment rate estimation failed.',
                 0,
@@ -76,7 +77,36 @@ class EasyPostService
         ];
     }
 
-    private function client(string $apiKey): EasyPostClient
+    /**
+     * @return array<string, mixed>
+     */
+    public function generateLabel(string $shipmentId, string $rateId): array
+    {
+        $apiKey = $this->getApiKey();
+        $shipment = $this->retrieveShipment($apiKey, $shipmentId);
+
+        if ($this->isPurchasedShipment($shipment)) {
+            return $this->normalizePurchasedShipment($shipment, $rateId);
+        }
+
+        if (! $this->shipmentHasRate($shipment, $rateId)) {
+            throw new RuntimeException('Selected EasyPost rate does not belong to the shipment.');
+        }
+
+        try {
+            $purchasedShipment = $this->client($apiKey)->shipment->buy($shipmentId, ['id' => $rateId]);
+        } catch (EasyPostException | Throwable $exception) {
+            throw new RuntimeException(
+                'EasyPost shipment purchase failed.',
+                0,
+                $exception
+            );
+        }
+
+        return $this->normalizePurchasedShipment($purchasedShipment, $rateId);
+    }
+
+    protected function client(string $apiKey): EasyPostClient
     {
         if ($this->client instanceof EasyPostClient) {
             return $this->client;
@@ -85,6 +115,36 @@ class EasyPostService
         $this->client = new EasyPostClient($apiKey);
 
         return $this->client;
+    }
+
+    /**
+     * @return mixed
+     */
+    private function retrieveShipment(string $apiKey, string $shipmentId): mixed
+    {
+        try {
+            return $this->client($apiKey)->shipment->retrieve($shipmentId);
+        } catch (ApiException $exception) {
+            if (($exception->getHttpStatus() ?? null) === 404) {
+                throw new RuntimeException(
+                    'EasyPost shipment not found.',
+                    0,
+                    $exception
+                );
+            }
+
+            throw new RuntimeException(
+                'Unable to retrieve EasyPost shipment.',
+                0,
+                $exception
+            );
+        } catch (EasyPostException | Throwable $exception) {
+            throw new RuntimeException(
+                'Unable to retrieve EasyPost shipment.',
+                0,
+                $exception
+            );
+        }
     }
 
     private function getApiKey(): string
@@ -157,5 +217,245 @@ class EasyPostService
         }
 
         throw new RuntimeException('Unexpected EasyPost rate payload received.');
+    }
+
+    /**
+     * @return array<string, mixed>|null
+     */
+    private function normalizeSelectedRate(mixed $rate): ?array
+    {
+        if ($rate === null) {
+            return null;
+        }
+
+        $normalizedRate = $this->normalizeRate($rate);
+
+        return [
+            'rate_id' => $normalizedRate['id'] ?? null,
+            'carrier' => $normalizedRate['carrier'] ?? null,
+            'service' => $normalizedRate['service'] ?? null,
+            'rate' => $normalizedRate['rate'] ?? null,
+            'currency' => $normalizedRate['currency'] ?? null,
+        ];
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function normalizePostageLabel(mixed $label): array
+    {
+        return [
+            'id' => data_get($label, 'id'),
+            'url' => data_get($label, 'label_url'),
+            'pdf_url' => data_get($label, 'label_pdf_url'),
+            'zpl_url' => data_get($label, 'label_zpl_url'),
+            'epl2_url' => data_get($label, 'label_epl2_url'),
+            'file_type' => data_get($label, 'label_file_type'),
+            'size' => data_get($label, 'label_size'),
+        ];
+    }
+
+    private function shipmentHasRate(mixed $shipment, string $rateId): bool
+    {
+        foreach ((array) data_get($shipment, 'rates', []) as $rate) {
+            if ((string) data_get($rate, 'id') === $rateId) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function isPurchasedShipment(mixed $shipment): bool
+    {
+        $status = strtolower((string) data_get($shipment, 'status', ''));
+
+        return $status === 'purchased'
+            || filled(data_get($shipment, 'tracking_code'))
+            || filled(data_get($shipment, 'postage_label'));
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function normalizePurchasedShipment(mixed $shipment, ?string $rateId = null): array
+    {
+        $selectedRate = $this->normalizeSelectedRate(data_get($shipment, 'selected_rate'));
+
+        if ($selectedRate === null && filled($rateId)) {
+            foreach ((array) data_get($shipment, 'rates', []) as $rate) {
+                if ((string) data_get($rate, 'id') !== $rateId) {
+                    continue;
+                }
+
+                $selectedRate = $this->normalizeSelectedRate($rate);
+                break;
+            }
+        }
+
+        return [
+            'shipment_id' => data_get($shipment, 'id'),
+            'selected_rate' => $selectedRate,
+            'tracking_code' => data_get($shipment, 'tracking_code'),
+            'label' => $this->normalizePostageLabel(data_get($shipment, 'postage_label')),
+        ];
+    }
+    public function getSelectedRate(
+        string $shipmentId,
+        string $rateId
+    ): array {
+        $client = $this->client();
+
+        $shipment = $client->shipment->retrieve($shipmentId);
+
+        $selectedRate = collect($shipment->rates ?? [])
+            ->first(function ($rate) use ($rateId) {
+                return data_get($rate, 'id') === $rateId;
+            });
+
+        if (! $selectedRate) {
+            throw new \RuntimeException(
+                'Selected EasyPost rate does not belong to the shipment.'
+            );
+        }
+
+        return [
+            'shipment' => [
+                'id' => data_get($shipment, 'id'),
+
+                'from_address' => [
+                    'street1' => data_get($shipment, 'from_address.street1'),
+                    'street2' => data_get($shipment, 'from_address.street2'),
+                    'city' => data_get($shipment, 'from_address.city'),
+                    'state' => data_get($shipment, 'from_address.state'),
+                    'zip' => data_get($shipment, 'from_address.zip'),
+                    'country' => data_get($shipment, 'from_address.country'),
+                ],
+
+                'to_address' => [
+                    'street1' => data_get($shipment, 'to_address.street1'),
+                    'street2' => data_get($shipment, 'to_address.street2'),
+                    'city' => data_get($shipment, 'to_address.city'),
+                    'state' => data_get($shipment, 'to_address.state'),
+                    'zip' => data_get($shipment, 'to_address.zip'),
+                    'country' => data_get($shipment, 'to_address.country'),
+                ],
+
+                'parcel' => [
+                    'length' => data_get($shipment, 'parcel.length'),
+                    'width' => data_get($shipment, 'parcel.width'),
+                    'height' => data_get($shipment, 'parcel.height'),
+                    'weight' => data_get($shipment, 'parcel.weight'),
+                ],
+
+                'tracking_code' => data_get($shipment, 'tracking_code'),
+
+                'postage_label' => [
+                    'url' => data_get($shipment, 'postage_label.label_url'),
+                    'pdf_url' => data_get($shipment, 'postage_label.label_pdf_url'),
+                ],
+            ],
+
+            'selected_rate' => [
+                'id' => data_get($selectedRate, 'id'),
+                'carrier' => data_get($selectedRate, 'carrier'),
+                'service' => data_get($selectedRate, 'service'),
+                'rate' => data_get($selectedRate, 'rate'),
+                'currency' => data_get($selectedRate, 'currency'),
+                'delivery_days' => data_get($selectedRate, 'delivery_days'),
+                'delivery_date' => data_get($selectedRate, 'delivery_date'),
+                'delivery_date_guaranteed' => data_get(
+                    $selectedRate,
+                    'delivery_date_guaranteed',
+                    false
+                ),
+            ],
+        ];
+    }
+
+    public function getShipmentRates(string $shipmentId): array
+    {
+        try {
+            $apiKey = $this->getApiKey();
+
+              $client = $this->client($apiKey);
+
+            $shipment = $client->shipment->retrieve($shipmentId);
+
+            $rates = collect($shipment->rates ?? [])
+                ->map(function ($rate) {
+                    return [
+                        'id' => $rate->id ?? null,
+                        'carrier' => $rate->carrier ?? null,
+                        'service' => $rate->service ?? null,
+                        'rate' => $rate->rate ?? null,
+                        'currency' => $rate->currency ?? null,
+                        'delivery_days' => $rate->delivery_days ?? null,
+                        'delivery_date' => $rate->delivery_date ?? null,
+                        'delivery_date_guaranteed' =>
+                        $rate->delivery_date_guaranteed ?? false,
+                    ];
+                })
+                ->sortBy(
+                    fn(array $rate) =>
+                    is_numeric($rate['rate'] ?? null)
+                        ? (float) $rate['rate']
+                        : PHP_FLOAT_MAX
+                )
+                ->values()
+                ->all();
+
+            return [
+                'shipment_id' => $shipment->id ?? null,
+                'status' => $shipment->status ?? null,
+                'mode' => $shipment->mode ?? null,
+                'tracking_code' => $shipment->tracking_code ?? null,
+
+                'from_address' => [
+                    'name' => $shipment->from_address->name ?? null,
+                    'company' => $shipment->from_address->company ?? null,
+                    'street1' => $shipment->from_address->street1 ?? null,
+                    'street2' => $shipment->from_address->street2 ?? null,
+                    'city' => $shipment->from_address->city ?? null,
+                    'state' => $shipment->from_address->state ?? null,
+                    'zip' => $shipment->from_address->zip ?? null,
+                    'country' => $shipment->from_address->country ?? null,
+                    'phone' => $shipment->from_address->phone ?? null,
+                    'email' => $shipment->from_address->email ?? null,
+                    'residential' => $shipment->from_address->residential ?? null,
+                ],
+
+                'to_address' => [
+                    'name' => $shipment->to_address->name ?? null,
+                    'company' => $shipment->to_address->company ?? null,
+                    'street1' => $shipment->to_address->street1 ?? null,
+                    'street2' => $shipment->to_address->street2 ?? null,
+                    'city' => $shipment->to_address->city ?? null,
+                    'state' => $shipment->to_address->state ?? null,
+                    'zip' => $shipment->to_address->zip ?? null,
+                    'country' => $shipment->to_address->country ?? null,
+                    'phone' => $shipment->to_address->phone ?? null,
+                    'email' => $shipment->to_address->email ?? null,
+                    'residential' => $shipment->to_address->residential ?? null,
+                ],
+
+                'parcel' => [
+                    'id' => $shipment->parcel->id ?? null,
+                    'length' => $shipment->parcel->length ?? null,
+                    'width' => $shipment->parcel->width ?? null,
+                    'height' => $shipment->parcel->height ?? null,
+                    'weight' => $shipment->parcel->weight ?? null,
+                ],
+
+                'rates' => $rates,
+            ];
+        } catch (\Throwable $e) {
+            report($e);
+
+            throw new \RuntimeException(
+                'EasyPost error: ' . $e->getMessage(),
+                previous: $e
+            );
+        }
     }
 }
