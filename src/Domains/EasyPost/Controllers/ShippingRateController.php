@@ -24,7 +24,8 @@ class ShippingRateController extends Controller
             $data = $request->validated();
             $result = $this->easyPostService->getRates(
                 $data['from_address'],
-                $data['to_address']
+                $data['to_address'],
+                $data['parcel'],
             );
             return $this->buildSuccessResponse($result);
         } catch (RuntimeException | Throwable $exception) {

@@ -42,6 +42,13 @@ class ShippingRateRequest extends FormRequest
             'to_address.phone' => ['nullable', 'string'],
             'to_address.email' => ['nullable', 'email'],
             'to_address.residential' => ['nullable', 'boolean'],
+
+            // parcel
+            'parcel' => ['nullable', 'array'],
+            'parcel.length' => ['nullable', 'numeric'],
+            'parcel.width' => ['nullable', 'numeric'],
+            'parcel.height' => ['nullable', 'numeric'],
+            'parcel.weight' => ['nullable', 'numeric'],
         ];
     }
 
