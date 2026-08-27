@@ -106,6 +106,48 @@ class EasyPostService
         return $this->normalizePurchasedShipment($purchasedShipment, $rateId);
     }
 
+    /**
+     * @return array<string, mixed>
+     */
+    public function refundShipment(string $shipmentId): array
+    {
+        $apiKey = $this->getApiKey();
+        $shipment = $this->retrieveShipment($apiKey, $shipmentId);
+        $refundStatus = strtolower((string) data_get($shipment, 'refund_status', ''));
+
+        if (in_array($refundStatus, ['submitted', 'refunded'], true)) {
+            return $this->normalizeRefundShipment($shipment, true);
+        }
+
+        if (in_array($refundStatus, ['rejected', 'not_applicable'], true)) {
+            return $this->normalizeRefundShipment($shipment, false);
+        }
+
+        if (! $this->isPurchasedShipment($shipment)) {
+            throw new RuntimeException('This EasyPost shipment does not have a purchased shipping label.');
+        }
+
+        try {
+            $refundedShipment = $this->client($apiKey)->shipment->refund($shipmentId);
+        } catch (ApiException | Throwable $exception) {
+            if ($exception instanceof ApiException && (($exception->getHttpStatus() ?? null) === 404)) {
+                throw new RuntimeException(
+                    'EasyPost shipment not found.',
+                    0,
+                    $exception
+                );
+            }
+
+            throw new RuntimeException(
+                'Unable to refund EasyPost shipment.',
+                0,
+                $exception
+            );
+        }
+
+        return $this->normalizeRefundShipment($refundedShipment, false);
+    }
+
     protected function client(string $apiKey): EasyPostClient
     {
         if ($this->client instanceof EasyPostClient) {
@@ -273,6 +315,28 @@ class EasyPostService
         return $status === 'purchased'
             || filled(data_get($shipment, 'tracking_code'))
             || filled(data_get($shipment, 'postage_label'));
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function normalizeRefundShipment(mixed $shipment, bool $alreadyRequested): array
+    {
+        return [
+            'shipment_id' => data_get($shipment, 'id'),
+            'tracking_code' => data_get($shipment, 'tracking_code'),
+            'refund_status' => $this->normalizeRefundStatus(data_get($shipment, 'refund_status')),
+            'already_requested' => $alreadyRequested,
+        ];
+    }
+
+    private function normalizeRefundStatus(mixed $refundStatus): ?string
+    {
+        if (! is_string($refundStatus) || trim($refundStatus) === '') {
+            return null;
+        }
+
+        return strtolower(trim($refundStatus));
     }
 
     /**

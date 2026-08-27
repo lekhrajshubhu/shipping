@@ -7,7 +7,9 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Routing\Controller;
 use RuntimeException;
 use Systha\Shipping\Domains\EasyPost\Requests\GenerateShippingLabelRequest;
+use Systha\Shipping\Domains\EasyPost\Requests\RefundShippingLabelRequest;
 use Systha\Shipping\Domains\EasyPost\Resources\ShippingLabelResource;
+use Systha\Shipping\Domains\EasyPost\Resources\ShippingLabelRefundResource;
 use Systha\Shipping\Domains\EasyPost\Services\EasyPostService;
 use Throwable;
 
@@ -50,6 +52,36 @@ class ShippingLabelController extends Controller
         ]);
     }
 
+    public function refund(RefundShippingLabelRequest $request): JsonResponse
+    {
+        try {
+            $data = $request->validated();
+            $result = $this->easyPostService->refundShipment(
+                $data['shipment_id']
+            );
+        } catch (RuntimeException|Throwable $exception) {
+            $status = $this->determineStatusCode($exception);
+            $message = match ($status) {
+                404 => 'EasyPost shipment not found.',
+                422 => $exception->getMessage() === 'This EasyPost shipment does not have a purchased shipping label.'
+                    ? 'This EasyPost shipment does not have a purchased shipping label.'
+                    : 'Unable to refund shipping label.',
+                502 => 'Unable to refund shipping label with EasyPost.',
+                default => 'Unable to refund shipping label.',
+            };
+
+            return response()->json([
+                'success' => false,
+                'message' => $message,
+            ], $status);
+        }
+
+        return response()->json([
+            'success' => true,
+            'data' => ShippingLabelRefundResource::make($result)->resolve(request()),
+        ]);
+    }
+
     private function determineStatusCode(Throwable $exception): int
     {
         if ($exception instanceof RuntimeException) {
@@ -57,6 +89,7 @@ class ShippingLabelController extends Controller
                 'Selected EasyPost rate does not belong to the shipment.' => 422,
                 'EasyPost shipment not found.' => 404,
                 'EasyPost shipment is already purchased.' => 409,
+                'This EasyPost shipment does not have a purchased shipping label.' => 422,
                 default => $this->hasEasyPostExceptionInChain($exception) ? 502 : 500,
             };
         }
