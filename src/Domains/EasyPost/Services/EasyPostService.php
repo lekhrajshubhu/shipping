@@ -6,6 +6,7 @@ use EasyPost\EasyPostClient;
 use EasyPost\Exception\Api\ApiException;
 use EasyPost\Exception\General\EasyPostException;
 use RuntimeException;
+use Systha\Jwellery\Domains\Shared\Models\OrderShipment;
 use Throwable;
 
 class EasyPostService
@@ -86,7 +87,10 @@ class EasyPostService
         $shipment = $this->retrieveShipment($apiKey, $shipmentId);
 
         if ($this->isPurchasedShipment($shipment)) {
-            return $this->normalizePurchasedShipment($shipment, $rateId);
+            $result = $this->normalizePurchasedShipment($shipment, $rateId);
+            $this->syncPurchasedShipmentRecord($shipment, $result['selected_rate'] ?? null, $rateId);
+
+            return $result;
         }
 
         if (! $this->shipmentHasRate($shipment, $rateId)) {
@@ -103,7 +107,10 @@ class EasyPostService
             );
         }
 
-        return $this->normalizePurchasedShipment($purchasedShipment, $rateId);
+        $result = $this->normalizePurchasedShipment($purchasedShipment, $rateId);
+        $this->syncPurchasedShipmentRecord($purchasedShipment, $result['selected_rate'] ?? null, $rateId);
+
+        return $result;
     }
 
     /**
@@ -116,11 +123,17 @@ class EasyPostService
         $refundStatus = strtolower((string) data_get($shipment, 'refund_status', ''));
 
         if (in_array($refundStatus, ['submitted', 'refunded'], true)) {
-            return $this->normalizeRefundShipment($shipment, true);
+            $result = $this->normalizeRefundShipment($shipment, true);
+            $this->syncRefundShipmentRecord($shipment, (string) ($result['refund_status'] ?? $refundStatus), $result['tracking_code'] ?? null);
+
+            return $result;
         }
 
         if (in_array($refundStatus, ['rejected', 'not_applicable'], true)) {
-            return $this->normalizeRefundShipment($shipment, false);
+            $result = $this->normalizeRefundShipment($shipment, false);
+            $this->syncRefundShipmentRecord($shipment, (string) ($result['refund_status'] ?? $refundStatus), $result['tracking_code'] ?? null);
+
+            return $result;
         }
 
         if (! $this->isPurchasedShipment($shipment)) {
@@ -145,7 +158,10 @@ class EasyPostService
             );
         }
 
-        return $this->normalizeRefundShipment($refundedShipment, false);
+        $result = $this->normalizeRefundShipment($refundedShipment, false);
+        $this->syncRefundShipmentRecord($refundedShipment, (string) ($result['refund_status'] ?? 'submitted'), $result['tracking_code'] ?? null);
+
+        return $result;
     }
 
     protected function client(string $apiKey): EasyPostClient
@@ -342,6 +358,166 @@ class EasyPostService
     /**
      * @return array<string, mixed>
      */
+    private function normalizeShipmentAddress(mixed $address): array
+    {
+        return [
+            'name' => data_get($address, 'name'),
+            'company' => data_get($address, 'company'),
+            'street1' => data_get($address, 'street1'),
+            'street2' => data_get($address, 'street2'),
+            'city' => data_get($address, 'city'),
+            'state' => data_get($address, 'state'),
+            'zip' => data_get($address, 'zip'),
+            'country' => data_get($address, 'country'),
+            'phone' => data_get($address, 'phone'),
+            'email' => data_get($address, 'email'),
+            'residential' => data_get($address, 'residential'),
+        ];
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function normalizeShipmentParcel(mixed $parcel): array
+    {
+        return [
+            'id' => data_get($parcel, 'id'),
+            'length' => data_get($parcel, 'length'),
+            'width' => data_get($parcel, 'width'),
+            'height' => data_get($parcel, 'height'),
+            'weight' => data_get($parcel, 'weight'),
+        ];
+    }
+
+    /**
+     * @return array<string, mixed>|null
+     */
+    private function resolveSelectedRateForShipment(mixed $shipment, ?string $rateId = null): ?array
+    {
+        $selectedRate = $this->normalizeSelectedRate(data_get($shipment, 'selected_rate'));
+
+        if ($selectedRate !== null) {
+            return $selectedRate;
+        }
+
+        if (! filled($rateId)) {
+            return null;
+        }
+
+        foreach ((array) data_get($shipment, 'rates', []) as $rate) {
+            if ((string) data_get($rate, 'id') !== $rateId) {
+                continue;
+            }
+
+            return $this->normalizeSelectedRate($rate);
+        }
+
+        return null;
+    }
+
+    /**
+     * @param  array<string, mixed>  $attributes
+     */
+    protected function persistOrderShipment(string $shipmentId, array $attributes): void
+    {
+        OrderShipment::query()->updateOrCreate(
+            ['shipment_id' => $shipmentId],
+            $attributes
+        );
+    }
+
+    /**
+     * @param  array<string, mixed>|null  $selectedRate
+     */
+    protected function syncSelectedShipmentRecord(mixed $shipment, ?array $selectedRate): void
+    {
+        $shipmentId = data_get($shipment, 'id');
+
+        if (! is_string($shipmentId) || trim($shipmentId) === '') {
+            return;
+        }
+
+        $this->persistOrderShipment($shipmentId, [
+            'rate_id' => $selectedRate['rate_id'] ?? null,
+            'carrier' => $selectedRate['carrier'] ?? null,
+            'amount' => $selectedRate['rate'] ?? null,
+            'parcel' => $this->normalizeShipmentParcel(data_get($shipment, 'parcel')),
+            'from_address' => $this->normalizeShipmentAddress(data_get($shipment, 'from_address')),
+            'to_address' => $this->normalizeShipmentAddress(data_get($shipment, 'to_address')),
+            'shipment_status' => data_get($shipment, 'status'),
+        ]);
+    }
+
+    /**
+     * @param  array<string, mixed>|null  $selectedRate
+     */
+    protected function syncPurchasedShipmentRecord(mixed $shipment, ?array $selectedRate, ?string $fallbackRateId = null): void
+    {
+        $shipmentId = data_get($shipment, 'id');
+
+        if (! is_string($shipmentId) || trim($shipmentId) === '') {
+            return;
+        }
+
+        $resolvedRate = $selectedRate ?? $this->resolveSelectedRateForShipment($shipment, $fallbackRateId);
+
+        $this->persistOrderShipment($shipmentId, [
+            'rate_id' => $resolvedRate['rate_id'] ?? $fallbackRateId,
+            'carrier' => $resolvedRate['carrier'] ?? null,
+            'amount' => $resolvedRate['rate'] ?? null,
+            'parcel' => $this->normalizeShipmentParcel(data_get($shipment, 'parcel')),
+            'shipment_label' => $this->normalizePostageLabel(data_get($shipment, 'postage_label')),
+            'tracking_number' => data_get($shipment, 'tracking_code'),
+            'from_address' => $this->normalizeShipmentAddress(data_get($shipment, 'from_address')),
+            'to_address' => $this->normalizeShipmentAddress(data_get($shipment, 'to_address')),
+            'shipment_status' => data_get($shipment, 'status'),
+        ]);
+    }
+
+    protected function syncRefundShipmentRecord(mixed $shipment, string $refundStatus, ?string $trackingCode = null): void
+    {
+        $shipmentId = data_get($shipment, 'id');
+
+        if (! is_string($shipmentId) || trim($shipmentId) === '') {
+            return;
+        }
+
+        $existing = OrderShipment::query()->where('shipment_id', $shipmentId)->first();
+        $now = now();
+        $refundRequestedAt = $existing?->refund_requested_at;
+        $refundedAt = $existing?->refunded_at;
+
+        if (in_array($refundStatus, ['submitted', 'refunded'], true) && ! $refundRequestedAt) {
+            $refundRequestedAt = $now;
+        }
+
+        if ($refundStatus === 'refunded' && ! $refundedAt) {
+            $refundedAt = $now;
+        }
+
+        $selectedRate = $this->resolveSelectedRateForShipment($shipment, $existing?->rate_id);
+
+        $this->persistOrderShipment($shipmentId, [
+            'rate_id' => $existing?->rate_id ?? $selectedRate['rate_id'] ?? null,
+            'carrier' => $existing?->carrier ?? $selectedRate['carrier'] ?? null,
+            'amount' => $existing?->amount ?? $selectedRate['rate'] ?? null,
+            'parcel' => $existing?->parcel ?? $this->normalizeShipmentParcel(data_get($shipment, 'parcel')),
+            'shipment_label' => $existing?->shipment_label ?? $this->normalizePostageLabel(data_get($shipment, 'postage_label')),
+            'tracking_number' => filled($trackingCode)
+                ? $trackingCode
+                : ($existing?->tracking_number ?? data_get($shipment, 'tracking_code')),
+            'from_address' => $existing?->from_address ?? $this->normalizeShipmentAddress(data_get($shipment, 'from_address')),
+            'to_address' => $existing?->to_address ?? $this->normalizeShipmentAddress(data_get($shipment, 'to_address')),
+            'shipment_status' => $existing?->shipment_status ?? data_get($shipment, 'status'),
+            'refund_status' => $refundStatus,
+            'refund_requested_at' => $refundRequestedAt,
+            'refunded_at' => $refundedAt,
+        ]);
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
     private function normalizePurchasedShipment(mixed $shipment, ?string $rateId = null): array
     {
         $selectedRate = $this->normalizeSelectedRate(data_get($shipment, 'selected_rate'));
@@ -368,20 +544,29 @@ class EasyPostService
         string $shipmentId,
         string $rateId
     ): array {
-        $client = $this->client();
+        $apiKey = $this->getApiKey();
+        $client = $this->client($apiKey);
 
         $shipment = $client->shipment->retrieve($shipmentId);
 
-        $selectedRate = collect($shipment->rates ?? [])
-            ->first(function ($rate) use ($rateId) {
-                return data_get($rate, 'id') === $rateId;
-            });
+        $selectedRate = null;
+
+        foreach ((array) data_get($shipment, 'rates', []) as $rate) {
+            if ((string) data_get($rate, 'id') !== $rateId) {
+                continue;
+            }
+
+            $selectedRate = $this->normalizeSelectedRate($rate);
+            break;
+        }
 
         if (! $selectedRate) {
             throw new \RuntimeException(
                 'Selected EasyPost rate does not belong to the shipment.'
             );
         }
+
+        $this->syncSelectedShipmentRecord($shipment, $selectedRate);
 
         return [
             'shipment' => [
@@ -421,18 +606,15 @@ class EasyPostService
             ],
 
             'selected_rate' => [
-                'id' => data_get($selectedRate, 'id'),
-                'carrier' => data_get($selectedRate, 'carrier'),
-                'service' => data_get($selectedRate, 'service'),
-                'rate' => data_get($selectedRate, 'rate'),
-                'currency' => data_get($selectedRate, 'currency'),
-                'delivery_days' => data_get($selectedRate, 'delivery_days'),
-                'delivery_date' => data_get($selectedRate, 'delivery_date'),
-                'delivery_date_guaranteed' => data_get(
-                    $selectedRate,
-                    'delivery_date_guaranteed',
-                    false
-                ),
+                'id' => $selectedRate['rate_id'] ?? null,
+                'rate_id' => $selectedRate['rate_id'] ?? null,
+                'carrier' => $selectedRate['carrier'] ?? null,
+                'service' => $selectedRate['service'] ?? null,
+                'rate' => $selectedRate['rate'] ?? null,
+                'currency' => $selectedRate['currency'] ?? null,
+                'delivery_days' => $selectedRate['delivery_days'] ?? null,
+                'delivery_date' => $selectedRate['delivery_date'] ?? null,
+                'delivery_date_guaranteed' => $selectedRate['delivery_date_guaranteed'] ?? false,
             ],
         ];
     }

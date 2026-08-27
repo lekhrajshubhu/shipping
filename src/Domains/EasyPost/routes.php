@@ -3,6 +3,7 @@
 use Illuminate\Support\Facades\Route;
 use Systha\Shipping\Domains\EasyPost\Controllers\AddressController;
 use Systha\Shipping\Domains\EasyPost\Controllers\EasyPostController;
+use Systha\Shipping\Domains\EasyPost\Controllers\EasyPostWebhookController;
 use Systha\Shipping\Domains\EasyPost\Controllers\ShippingLabelController;
 use Systha\Shipping\Domains\EasyPost\Controllers\ShippingRateController;
 
@@ -19,6 +20,8 @@ Route::prefix('api/v2/shipping/easypost')->group(function (): void {
     Route::post('/labels/generate', [ShippingLabelController::class, 'generate']);
 
     Route::post('/labels/refund', [ShippingLabelController::class, 'refund']);
+
+    Route::post('/webhooks', [EasyPostWebhookController::class, 'handle']);
     
     Route::post('/rates/selected', [ShippingRateController::class, 'selected']);
 
