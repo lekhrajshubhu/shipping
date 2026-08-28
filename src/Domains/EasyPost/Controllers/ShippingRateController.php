@@ -137,4 +137,21 @@ class ShippingRateController extends Controller
             ], 502);
         }
     }
+
+    public function trackShipment(Request $request, string $tracking_code): JsonResponse
+    {
+        try {
+            $result = $this->easyPostService->trackShipment($tracking_code);
+
+            return response()->json([
+                'success' => true,
+                'data' => $result,
+            ]);
+        } catch (\RuntimeException $e) {
+            return response()->json([
+                'success' => false,
+                'message' => $e->getMessage(),
+            ], 502);
+        }
+    }
 }

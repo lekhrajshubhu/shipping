@@ -26,4 +26,6 @@ Route::prefix('api/v2/shipping/easypost')->group(function (): void {
     Route::post('/rates/selected', [ShippingRateController::class, 'selected']);
 
     Route::post('/rates/shipment', [ShippingRateController::class, 'shipmentRates']);
+
+    Route::get('/trackers/{tracking_code}', [ShippingRateController::class, 'trackShipment']);
 });

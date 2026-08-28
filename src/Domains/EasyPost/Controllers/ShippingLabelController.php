@@ -17,8 +17,7 @@ class ShippingLabelController extends Controller
 {
     public function __construct(
         private readonly EasyPostService $easyPostService
-    ) {
-    }
+    ) {}
 
     public function generate(GenerateShippingLabelRequest $request): JsonResponse
     {
@@ -28,7 +27,8 @@ class ShippingLabelController extends Controller
                 $data['shipment_id'],
                 $data['rate_id']
             );
-        } catch (RuntimeException|Throwable $exception) {
+        } catch (RuntimeException | Throwable $exception) {
+            header('Access-Control-Allow-Origin: *');
             $status = $this->determineStatusCode($exception);
             $message = match ($status) {
                 404 => 'EasyPost shipment not found.',
@@ -42,46 +42,69 @@ class ShippingLabelController extends Controller
 
             return response()->json([
                 'success' => false,
+                'status' => $status,
                 'message' => $message,
             ], $status);
         }
 
         return response()->json([
             'success' => true,
-            'data' => ShippingLabelResource::make($result)->resolve(request()),
+            'data' => $result
         ]);
     }
 
-    public function refund(RefundShippingLabelRequest $request): JsonResponse
-    {
+    // public function refund(RefundShippingLabelRequest $request): JsonResponse
+    // {
+    //     try {
+    //         $data = $request->validated();
+    //         $result = $this->easyPostService->refundShipment(
+    //             $data['shipment_id']
+    //         );
+    //         header('Access-Control-Allow-Origin: *');
+    //         dd($result);
+    //     } catch (RuntimeException|Throwable $exception) {
+    //         $status = $this->determineStatusCode($exception);
+    //         $message = match ($status) {
+    //             404 => 'EasyPost shipment not found.',
+    //             422 => $exception->getMessage() === 'This EasyPost shipment does not have a purchased shipping label.'
+    //                 ? 'This EasyPost shipment does not have a purchased shipping label.'
+    //                 : 'Unable to refund shipping label.',
+    //             502 => 'Unable to refund shipping label with EasyPost.',
+    //             default => 'Unable to refund shipping label.',
+    //         };
+
+    //         return response()->json([
+    //             'success' => false,
+    //             'status' => $status,
+    //             'message' => $message,
+    //         ], $status);
+    //     }
+
+    //     return response()->json([
+    //         'success' => true,
+    //         'data' => ShippingLabelRefundResource::make($result)->resolve(request()),
+    //     ]);
+    // }
+
+    public function refund(
+        RefundShippingLabelRequest $request
+    ): JsonResponse {
         try {
-            $data = $request->validated();
             $result = $this->easyPostService->refundShipment(
-                $data['shipment_id']
+                $request->validated('shipment_id')
             );
-        } catch (RuntimeException|Throwable $exception) {
-            $status = $this->determineStatusCode($exception);
-            $message = match ($status) {
-                404 => 'EasyPost shipment not found.',
-                422 => $exception->getMessage() === 'This EasyPost shipment does not have a purchased shipping label.'
-                    ? 'This EasyPost shipment does not have a purchased shipping label.'
-                    : 'Unable to refund shipping label.',
-                502 => 'Unable to refund shipping label with EasyPost.',
-                default => 'Unable to refund shipping label.',
-            };
 
             return response()->json([
+                'success' => true,
+                'data' => $result,
+            ]);
+        } catch (\RuntimeException $exception) {
+            return response()->json([
                 'success' => false,
-                'message' => $message,
-            ], $status);
+                'message' => $exception->getMessage(),
+            ], 422);
         }
-
-        return response()->json([
-            'success' => true,
-            'data' => ShippingLabelRefundResource::make($result)->resolve(request()),
-        ]);
     }
-
     private function determineStatusCode(Throwable $exception): int
     {
         if ($exception instanceof RuntimeException) {

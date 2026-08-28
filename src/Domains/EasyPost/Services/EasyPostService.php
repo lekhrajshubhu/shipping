@@ -5,6 +5,8 @@ namespace Systha\Shipping\Domains\EasyPost\Services;
 use EasyPost\EasyPostClient;
 use EasyPost\Exception\Api\ApiException;
 use EasyPost\Exception\General\EasyPostException;
+use Exception;
+use Illuminate\Support\Facades\Log;
 use RuntimeException;
 use Systha\Jwellery\Domains\Shared\Models\OrderShipment;
 use Throwable;
@@ -88,8 +90,8 @@ class EasyPostService
 
         if ($this->isPurchasedShipment($shipment)) {
             $result = $this->normalizePurchasedShipment($shipment, $rateId);
-            $this->syncPurchasedShipmentRecord($shipment, $result['selected_rate'] ?? null, $rateId);
-
+            $this->syncPurchasedShipmentRecord($result, $rateId);
+            $result['label_status'] = 'already_generated';
             return $result;
         }
 
@@ -108,8 +110,8 @@ class EasyPostService
         }
 
         $result = $this->normalizePurchasedShipment($purchasedShipment, $rateId);
-        $this->syncPurchasedShipmentRecord($purchasedShipment, $result['selected_rate'] ?? null, $rateId);
-
+        $this->syncPurchasedShipmentRecord($result, $rateId);
+        $result['label_status'] = 'label_generated';
         return $result;
     }
 
@@ -118,51 +120,80 @@ class EasyPostService
      */
     public function refundShipment(string $shipmentId): array
     {
-        $apiKey = $this->getApiKey();
-        $shipment = $this->retrieveShipment($apiKey, $shipmentId);
-        $refundStatus = strtolower((string) data_get($shipment, 'refund_status', ''));
-
-        if (in_array($refundStatus, ['submitted', 'refunded'], true)) {
-            $result = $this->normalizeRefundShipment($shipment, true);
-            $this->syncRefundShipmentRecord($shipment, (string) ($result['refund_status'] ?? $refundStatus), $result['tracking_code'] ?? null);
-
-            return $result;
-        }
-
-        if (in_array($refundStatus, ['rejected', 'not_applicable'], true)) {
-            $result = $this->normalizeRefundShipment($shipment, false);
-            $this->syncRefundShipmentRecord($shipment, (string) ($result['refund_status'] ?? $refundStatus), $result['tracking_code'] ?? null);
-
-            return $result;
-        }
-
-        if (! $this->isPurchasedShipment($shipment)) {
-            throw new RuntimeException('This EasyPost shipment does not have a purchased shipping label.');
-        }
-
         try {
-            $refundedShipment = $this->client($apiKey)->shipment->refund($shipmentId);
-        } catch (ApiException | Throwable $exception) {
-            if ($exception instanceof ApiException && (($exception->getHttpStatus() ?? null) === 404)) {
-                throw new RuntimeException(
-                    'EasyPost shipment not found.',
-                    0,
-                    $exception
+            $apiKey = $this->getApiKey();
+
+            $shipment = $this->retrieveShipment(
+                $apiKey,
+                $shipmentId
+            );
+
+            if (blank(data_get($shipment, 'postage_label'))) {
+                throw new \RuntimeException(
+                    'This shipment does not have a purchased shipping label.'
                 );
             }
 
-            throw new RuntimeException(
-                'Unable to refund EasyPost shipment.',
-                0,
-                $exception
+            $currentRefundStatus = data_get(
+                $shipment,
+                'refund_status'
+            );
+
+            if (in_array(
+                $currentRefundStatus,
+                ['submitted', 'refunded'],
+                true
+            )) {
+
+                $result = $this->normalizeRefundShipment($shipment);
+                $this->syncRefundShipmentRecord($result);
+                return $result;
+            }
+
+            $refundedShipment = $this->client($apiKey)
+                ->shipment
+                ->refund($shipmentId);
+
+            $result = $this->normalizeRefundShipment($refundedShipment);
+
+            $this->syncRefundShipmentRecord($result);
+            return $result;
+        } catch (\Throwable $exception) {
+            report($exception);
+
+            throw new \RuntimeException(
+                'EasyPost refund error: ' . $exception->getMessage(),
+                previous: $exception
             );
         }
-
-        $result = $this->normalizeRefundShipment($refundedShipment, false);
-        $this->syncRefundShipmentRecord($refundedShipment, (string) ($result['refund_status'] ?? 'submitted'), $result['tracking_code'] ?? null);
-
-        return $result;
     }
+
+    private function normalizeRefundShipment(mixed $shipment): array
+    {
+        return [
+            'shipment_id' => data_get($shipment, 'id'),
+            'tracking_code' => data_get($shipment, 'tracking_code'),
+            'status' => data_get($shipment, 'status'),
+            'refund_status' => data_get($shipment, 'refund_status'),
+            'already_requested' => data_get($shipment, 'already_requested', false),
+        ];
+    }
+
+    private function syncRefundShipmentRecord(array $shipment): void
+    {
+        $orderShipment = OrderShipment::where([
+            'shipment_id' => $shipment['shipment_id'] ?? null,
+            'tracking_number' => $shipment['tracking_code'] ?? null,
+        ])->first();
+        if ($orderShipment) {
+            $orderShipment->update([
+                'shipment_status' => $shipment['status'] ?? null,
+                'refund_status' => $shipment['refund_status'] ?? null,
+            ]);
+        }
+    }
+
+
 
     protected function client(string $apiKey): EasyPostClient
     {
@@ -305,9 +336,6 @@ class EasyPostService
         return [
             'id' => data_get($label, 'id'),
             'url' => data_get($label, 'label_url'),
-            'pdf_url' => data_get($label, 'label_pdf_url'),
-            'zpl_url' => data_get($label, 'label_zpl_url'),
-            'epl2_url' => data_get($label, 'label_epl2_url'),
             'file_type' => data_get($label, 'label_file_type'),
             'size' => data_get($label, 'label_size'),
         ];
@@ -336,13 +364,37 @@ class EasyPostService
     /**
      * @return array<string, mixed>
      */
-    private function normalizeRefundShipment(mixed $shipment, bool $alreadyRequested): array
-    {
+    private function normalizeRefundedShipment(
+        mixed $shipment,
+        bool $alreadyRequested
+    ): array {
         return [
-            'shipment_id' => data_get($shipment, 'id'),
-            'tracking_code' => data_get($shipment, 'tracking_code'),
-            'refund_status' => $this->normalizeRefundStatus(data_get($shipment, 'refund_status')),
+            'shipment_id' => data_get(
+                $shipment,
+                'id'
+            ),
+
+            'tracking_code' => data_get(
+                $shipment,
+                'tracking_code'
+            ),
+
+            'status' => data_get(
+                $shipment,
+                'status'
+            ),
+
+            'refund_status' => data_get(
+                $shipment,
+                'refund_status'
+            ),
+
             'already_requested' => $alreadyRequested,
+            'label' => $this->normalizePostageLabel(
+                data_get($shipment, 'postage_label')
+            ),
+
+
         ];
     }
 
@@ -451,76 +503,44 @@ class EasyPostService
     /**
      * @param  array<string, mixed>|null  $selectedRate
      */
-    protected function syncPurchasedShipmentRecord(mixed $shipment, ?array $selectedRate, ?string $fallbackRateId = null): void
+    protected function syncPurchasedShipmentRecord(mixed $shipment, string $rateId): void
     {
-        $shipmentId = data_get($shipment, 'id');
-
+        $shipmentId = data_get($shipment, 'shipment_id');
         if (! is_string($shipmentId) || trim($shipmentId) === '') {
             return;
         }
-
-        $resolvedRate = $selectedRate ?? $this->resolveSelectedRateForShipment($shipment, $fallbackRateId);
-
-        $this->persistOrderShipment($shipmentId, [
-            'rate_id' => $resolvedRate['rate_id'] ?? $fallbackRateId,
-            'carrier' => $resolvedRate['carrier'] ?? null,
-            'amount' => $resolvedRate['rate'] ?? null,
-            'parcel' => $this->normalizeShipmentParcel(data_get($shipment, 'parcel')),
-            'shipment_label' => $this->normalizePostageLabel(data_get($shipment, 'postage_label')),
-            'tracking_number' => data_get($shipment, 'tracking_code'),
-            'from_address' => $this->normalizeShipmentAddress(data_get($shipment, 'from_address')),
-            'to_address' => $this->normalizeShipmentAddress(data_get($shipment, 'to_address')),
-            'shipment_status' => data_get($shipment, 'status'),
-        ]);
+        try {
+            OrderShipment::query()->updateOrCreate(
+                [
+                    'shipment_id' => $shipmentId,
+                    'rate_id' => $rateId
+                ],
+                [
+                    'shipment_data' => $shipment,
+                    'shipment_label' => data_get($shipment, 'label.url'),
+                    'tracking_number' => data_get($shipment, 'tracking_code'),
+                    'shipment_status' => data_get($shipment, 'shipment_status'),
+                    'refund_status' => data_get($shipment, 'refund_status'),
+                    'amount' => data_get($shipment, 'selected_rate.rate'),
+                ]
+            );
+        } catch (\Throwable $th) {
+            Log::error([
+                'error' => $th->getMessage(),
+                'order_shipment' => $shipment
+            ]);
+        }
     }
 
-    protected function syncRefundShipmentRecord(mixed $shipment, string $refundStatus, ?string $trackingCode = null): void
-    {
-        $shipmentId = data_get($shipment, 'id');
-
-        if (! is_string($shipmentId) || trim($shipmentId) === '') {
-            return;
-        }
-
-        $existing = OrderShipment::query()->where('shipment_id', $shipmentId)->first();
-        $now = now();
-        $refundRequestedAt = $existing?->refund_requested_at;
-        $refundedAt = $existing?->refunded_at;
-
-        if (in_array($refundStatus, ['submitted', 'refunded'], true) && ! $refundRequestedAt) {
-            $refundRequestedAt = $now;
-        }
-
-        if ($refundStatus === 'refunded' && ! $refundedAt) {
-            $refundedAt = $now;
-        }
-
-        $selectedRate = $this->resolveSelectedRateForShipment($shipment, $existing?->rate_id);
-
-        $this->persistOrderShipment($shipmentId, [
-            'rate_id' => $existing?->rate_id ?? $selectedRate['rate_id'] ?? null,
-            'carrier' => $existing?->carrier ?? $selectedRate['carrier'] ?? null,
-            'amount' => $existing?->amount ?? $selectedRate['rate'] ?? null,
-            'parcel' => $existing?->parcel ?? $this->normalizeShipmentParcel(data_get($shipment, 'parcel')),
-            'shipment_label' => $existing?->shipment_label ?? $this->normalizePostageLabel(data_get($shipment, 'postage_label')),
-            'tracking_number' => filled($trackingCode)
-                ? $trackingCode
-                : ($existing?->tracking_number ?? data_get($shipment, 'tracking_code')),
-            'from_address' => $existing?->from_address ?? $this->normalizeShipmentAddress(data_get($shipment, 'from_address')),
-            'to_address' => $existing?->to_address ?? $this->normalizeShipmentAddress(data_get($shipment, 'to_address')),
-            'shipment_status' => $existing?->shipment_status ?? data_get($shipment, 'status'),
-            'refund_status' => $refundStatus,
-            'refund_requested_at' => $refundRequestedAt,
-            'refunded_at' => $refundedAt,
-        ]);
-    }
 
     /**
      * @return array<string, mixed>
      */
     private function normalizePurchasedShipment(mixed $shipment, ?string $rateId = null): array
     {
-        $selectedRate = $this->normalizeSelectedRate(data_get($shipment, 'selected_rate'));
+        $selectedRate = $this->normalizeSelectedRate(
+            data_get($shipment, 'selected_rate')
+        );
 
         if ($selectedRate === null && filled($rateId)) {
             foreach ((array) data_get($shipment, 'rates', []) as $rate) {
@@ -535,9 +555,47 @@ class EasyPostService
 
         return [
             'shipment_id' => data_get($shipment, 'id'),
+            'shipment_status' => data_get($shipment, 'status'),
+            'refund_status' => data_get($shipment, 'refund_status'),
+            'mode' => data_get($shipment, 'mode'),
+
+            'from_address' => [
+                'id' => data_get($shipment, 'from_address.id'),
+                'name' => data_get($shipment, 'from_address.name'),
+                'company' => data_get($shipment, 'from_address.company'),
+                'street1' => data_get($shipment, 'from_address.street1'),
+                'street2' => data_get($shipment, 'from_address.street2'),
+                'city' => data_get($shipment, 'from_address.city'),
+                'state' => data_get($shipment, 'from_address.state'),
+                'zip' => data_get($shipment, 'from_address.zip'),
+                'country' => data_get($shipment, 'from_address.country'),
+                'phone' => data_get($shipment, 'from_address.phone'),
+                'email' => data_get($shipment, 'from_address.email'),
+                'residential' => data_get($shipment, 'from_address.residential'),
+            ],
+
+            'to_address' => [
+                'id' => data_get($shipment, 'to_address.id'),
+                'name' => data_get($shipment, 'to_address.name'),
+                'company' => data_get($shipment, 'to_address.company'),
+                'street1' => data_get($shipment, 'to_address.street1'),
+                'street2' => data_get($shipment, 'to_address.street2'),
+                'city' => data_get($shipment, 'to_address.city'),
+                'state' => data_get($shipment, 'to_address.state'),
+                'zip' => data_get($shipment, 'to_address.zip'),
+                'country' => data_get($shipment, 'to_address.country'),
+                'phone' => data_get($shipment, 'to_address.phone'),
+                'email' => data_get($shipment, 'to_address.email'),
+                'residential' => data_get($shipment, 'to_address.residential'),
+            ],
+
             'selected_rate' => $selectedRate,
+
             'tracking_code' => data_get($shipment, 'tracking_code'),
-            'label' => $this->normalizePostageLabel(data_get($shipment, 'postage_label')),
+
+            'label' => $this->normalizePostageLabel(
+                data_get($shipment, 'postage_label')
+            ),
         ];
     }
     public function getSelectedRate(
@@ -624,7 +682,7 @@ class EasyPostService
         try {
             $apiKey = $this->getApiKey();
 
-              $client = $this->client($apiKey);
+            $client = $this->client($apiKey);
 
             $shipment = $client->shipment->retrieve($shipmentId);
 
@@ -703,5 +761,226 @@ class EasyPostService
                 previous: $e
             );
         }
+    }
+
+    public function trackShipment(string $tracking_code): array
+    {
+        try {
+
+            $apiKey = $this->getApiKey();
+
+            $client = $this->client($apiKey);
+
+            $tracker = $client->tracker->retrieve($tracking_code);
+
+            return $this->normalizeTracker($tracker);
+        } catch (\Throwable $e) {
+            report($e);
+
+            throw new \RuntimeException(
+                'EasyPost error: ' . $e->getMessage(),
+                previous: $e
+            );
+        }
+    }
+    private function normalizeTracker(mixed $tracker): array
+    {
+        return [
+            'id' => data_get($tracker, 'id'),
+            'object' => data_get($tracker, 'object'),
+            'mode' => data_get($tracker, 'mode'),
+            'tracking_code' => data_get($tracker, 'tracking_code'),
+            'status' => data_get($tracker, 'status'),
+            'status_detail' => data_get($tracker, 'status_detail'),
+
+            'created_at' => data_get($tracker, 'created_at'),
+            'updated_at' => data_get($tracker, 'updated_at'),
+
+            'signed_by' => data_get($tracker, 'signed_by'),
+            'weight' => data_get($tracker, 'weight'),
+
+            'est_delivery_date' => data_get(
+                $tracker,
+                'est_delivery_date'
+            ),
+
+            'shipment_id' => data_get(
+                $tracker,
+                'shipment_id'
+            ),
+
+            'carrier' => data_get(
+                $tracker,
+                'carrier'
+            ),
+
+            'tracking_details' => collect(
+                data_get($tracker, 'tracking_details', [])
+            )
+                ->sortByDesc(fn($detail) => data_get($detail, 'datetime'))
+                ->values()
+                ->map(function ($detail) {
+                    return [
+                        'object' => data_get($detail, 'object'),
+                        'message' => data_get($detail, 'message'),
+                        'description' => data_get($detail, 'description'),
+                        'status' => data_get($detail, 'status'),
+                        'status_detail' => data_get($detail, 'status_detail'),
+                        'datetime' => data_get($detail, 'datetime'),
+                        'source' => data_get($detail, 'source'),
+                        'carrier_code' => data_get($detail, 'carrier_code'),
+                        'est_delivery_date' => data_get(
+                            $detail,
+                            'est_delivery_date'
+                        ),
+                        'tracking_location' => [
+                            'object' => data_get(
+                                $detail,
+                                'tracking_location.object'
+                            ),
+                            'city' => data_get(
+                                $detail,
+                                'tracking_location.city'
+                            ),
+                            'state' => data_get(
+                                $detail,
+                                'tracking_location.state'
+                            ),
+                            'country' => data_get(
+                                $detail,
+                                'tracking_location.country'
+                            ),
+                            'zip' => data_get(
+                                $detail,
+                                'tracking_location.zip'
+                            ),
+                        ],
+                    ];
+                })
+                ->all(),
+
+            'fees' => collect(
+                data_get($tracker, 'fees', [])
+            )->map(function ($fee) {
+                return [
+                    'object' => data_get($fee, 'object'),
+                    'type' => data_get($fee, 'type'),
+                    'amount' => data_get($fee, 'amount'),
+                    'charged' => data_get($fee, 'charged'),
+                    'refunded' => data_get($fee, 'refunded'),
+                ];
+            })->values()->all(),
+
+            'carrier_detail' => [
+                'object' => data_get(
+                    $tracker,
+                    'carrier_detail.object'
+                ),
+
+                'service' => data_get(
+                    $tracker,
+                    'carrier_detail.service'
+                ),
+
+                'container_type' => data_get(
+                    $tracker,
+                    'carrier_detail.container_type'
+                ),
+
+                'est_delivery_date_local' => data_get(
+                    $tracker,
+                    'carrier_detail.est_delivery_date_local'
+                ),
+
+                'est_delivery_time_local' => data_get(
+                    $tracker,
+                    'carrier_detail.est_delivery_time_local'
+                ),
+
+                'origin_location' => data_get(
+                    $tracker,
+                    'carrier_detail.origin_location'
+                ),
+
+                'origin_tracking_location' => [
+                    'object' => data_get(
+                        $tracker,
+                        'carrier_detail.origin_tracking_location.object'
+                    ),
+
+                    'city' => data_get(
+                        $tracker,
+                        'carrier_detail.origin_tracking_location.city'
+                    ),
+
+                    'state' => data_get(
+                        $tracker,
+                        'carrier_detail.origin_tracking_location.state'
+                    ),
+
+                    'country' => data_get(
+                        $tracker,
+                        'carrier_detail.origin_tracking_location.country'
+                    ),
+
+                    'zip' => data_get(
+                        $tracker,
+                        'carrier_detail.origin_tracking_location.zip'
+                    ),
+                ],
+
+                'destination_location' => data_get(
+                    $tracker,
+                    'carrier_detail.destination_location'
+                ),
+
+                'destination_tracking_location' => [
+                    'object' => data_get(
+                        $tracker,
+                        'carrier_detail.destination_tracking_location.object'
+                    ),
+
+                    'city' => data_get(
+                        $tracker,
+                        'carrier_detail.destination_tracking_location.city'
+                    ),
+
+                    'state' => data_get(
+                        $tracker,
+                        'carrier_detail.destination_tracking_location.state'
+                    ),
+
+                    'country' => data_get(
+                        $tracker,
+                        'carrier_detail.destination_tracking_location.country'
+                    ),
+
+                    'zip' => data_get(
+                        $tracker,
+                        'carrier_detail.destination_tracking_location.zip'
+                    ),
+                ],
+
+                'guaranteed_delivery_date' => data_get(
+                    $tracker,
+                    'carrier_detail.guaranteed_delivery_date'
+                ),
+
+                'alternate_identifier' => data_get(
+                    $tracker,
+                    'carrier_detail.alternate_identifier'
+                ),
+
+                'initial_delivery_attempt' => data_get(
+                    $tracker,
+                    'carrier_detail.initial_delivery_attempt'
+                ),
+            ],
+
+            'public_url' => data_get(
+                $tracker,
+                'public_url'
+            ),
+        ];
     }
 }
